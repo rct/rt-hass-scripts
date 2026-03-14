@@ -127,7 +127,7 @@ class HassInfo:
     def run_cmd(self, cmd):
         """run an 'ha ...' or other command on the Hass host
         
-        subproces.run output is saved as last_cmd_results in the object"""
+        subproces.run output is saved as last_cmd_result in the object"""
 
         run_cmd = self.cmd_args + cmd
         log.debug(f"Running cmd: {run_cmd}")
@@ -136,8 +136,10 @@ class HassInfo:
         self.last_cmd_result = subprocess.run(run_cmd, capture_output=True)
         
         self.last_cmd_runtime = time.time() - time_start
+        log.debug(f"Cmd return code: {self.last_cmd_result.returncode}")
+        log.debug(f"Cmd return stderr: {self.last_cmd_result.stderr}")
         log.debug(f"Cmd runtime: {self.last_cmd_runtime:.1f} seconds")
-        log.debug(f"Cmd results {self.last_cmd_result}")
+        log.debug(f"Cmd result {self.last_cmd_result}")
 
         # XXX check success, disable host if cmd fails
         # XXX not returing anything because output is saved as an instance variable
@@ -147,6 +149,8 @@ class HassInfo:
             return True
         else:
             # Running host info failed, so disable host
+
+            # XXX This is suspect, old refactor stuff that should be deleted?
             self.enabled = False
             self.disable_reason = "disabled: ha host info failed"
         
@@ -252,7 +256,7 @@ class HassInfo:
 
         if not backup.enabled:
             log.info(f"Skipping disabled backup: {self.name} {backup.name}")
-            return
+            return # None == Skipped
 
         backup_name = backup.get_name()
 
@@ -263,24 +267,35 @@ class HassInfo:
         log.info(f"{self.name} Backup cmd {cmd_args}")
 
         if dryrun:
-            return
-        
+            log.info(f"{self.name} DRYRUN, skipping backup")
+            return # None == Skipped
+
+
         if self.run_cmd(cmd_args):
             result = yaml.safe_load(self.last_cmd_result.stdout)
             backup.slug = result["slug"]
             backup.cmd_runtime = self.last_cmd_runtime
 
-
+            # Now that we have the backup slug, query backup info to get size, etc. 
             self.run_cmd([ "ha", "backups", "info", backup.slug ])
-            backup.results = yaml.safe_load(self.last_cmd_result.stdout)
-            size = backup.results["size"]
+            backup.info_result = yaml.safe_load(self.last_cmd_result.stdout)
 
+            size = backup.info_result["size"]
         
-        # move?
-        # Add to some more permanent log
-        # Save backup info to {slug}.yaml? 
-        log.info(f"Backup result {self.name}: {backup.name}, slug: {backup.slug} size: {size}MB, runtime: {backup.cmd_runtime:.1f} ")
+            # move?
+            # Add to some more permanent log
+            # Save backup info to {slug}.yaml? 
+            log.info(f"Backup result {self.name}: {backup.name}, slug: {backup.slug} size: {size}MB, runtime: {backup.cmd_runtime:.1f} ")
 
+        else:
+            stderr_txt = yaml.safe_load(self.last_cmd_result.stderr)
+            log.error(f"Backup FAILED {self.name}: {backup.name}. Return Code: {self.last_cmd_result.returncode}, STDERR: {stderr_txt}")
+
+            return False
+
+
+
+        return True
 
     @staticmethod
     def parseyaml(yamlstr) -> list:
@@ -337,7 +352,7 @@ class HassBackup:
 
         # Results of running a backup
         self.slug = ""
-        self.results = {}
+        self.info_result = {}
 
         if bconfig.get("enabled") == "false" or bconfig.get("enabled") == "False":
             return False
@@ -492,6 +507,11 @@ def main():
     log.debug("Starting")
     hass_configs = HassInfo.parseyaml(arg_results.config_file)
 
+    exit_code = 0
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+
     # print("\n\nbackups:\n")
     # XXX TODO run backups
     for hasshostname, hasshost in hass_configs.items():
@@ -502,14 +522,33 @@ def main():
         # @todo this could/should be done lazily only if there are addons to backup
         # hasshost.get_addons_info()
 
-        log.info(f"Starting backups for {hasshostname}")
+        log.info(f"===================================")
+        log.info(f"==== Starting backups for {hasshostname} ====")
         for backup in hass_configs[hasshostname].backups_defined:
-            log.info(f"Starting backup {hasshostname}: {backup.name}")
-            hass_configs[hasshostname].run_backup(backup, dryrun = arg_dryrun)
-        
+            log.info(f"---- Starting backup {hasshostname} - {backup.name} ----")
+            result = hass_configs[hasshostname].run_backup(backup, dryrun = arg_dryrun)
+            log.info(f"---- Result: {result} for {hasshostname} - {backup.name} ----")
+
+
+            if not result:
+                if result is not None:
+                    exit_code = 1
+                    failed_count += 1
+                    # XXX TODO Syslog / Notify backup failure
+                    log.error(f"*** Backup failed for {hasshostname} - {backup.name}")
+                else:
+                    skipped_count += 1
+            else:
+                success_count += 1
+
+        log.info(f"==== Checking host info after backups ====")
         # Re-run host info to get disk space after backup
         hasshost.fetch_host_info()
 
+    # This should possibly go to syslog too
+    log.info(f"====== {hasshostname} Backup Results: {success_count} succeeded, {failed_count} failed {skipped_count} skipped ======")
+
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
